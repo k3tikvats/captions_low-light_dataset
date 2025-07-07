@@ -1,7 +1,6 @@
 import torch
 import torchvision
 from torch import nn
-from torch.nn import functional as F
 from torchvision import transforms, models
 from torch.utils.data import Dataset, DataLoader, random_split
 import json
@@ -31,96 +30,6 @@ model_output_dir = '/media/mlr-lab/325C37DE7879ABF2/Lowlight_4_7_25/Lowlightdata
 # Create output directory if it doesn't exist
 os.makedirs(model_output_dir, exist_ok=True)
 
-# Loss Functions
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-    
-    def forward(self, inputs, targets):
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-bce_loss)
-        focal_loss = self.alpha * (1-pt)**self.gamma * bce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
-
-class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8):
-        super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.clip = clip
-        self.eps = eps
-
-    def forward(self, x, y):
-        # Probability
-        xs_pos = torch.sigmoid(x)
-        xs_neg = 1 - xs_pos
-
-        # Clipping
-        if self.clip > 0:
-            xs_neg = torch.clamp(xs_neg, min=self.clip)
-
-        # Loss calculation
-        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
-        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
-
-        # Asymmetric focusing
-        loss = los_pos * torch.pow(1 - xs_pos, self.gamma_pos) + \
-               los_neg * torch.pow(xs_pos, self.gamma_neg)
-        
-        return -loss.mean()
-
-class ClassBalancedLoss(nn.Module):
-    def __init__(self, num_classes, beta=0.9999):
-        super().__init__()
-        self.num_classes = num_classes
-        self.beta = beta
-        
-    def forward(self, logits, labels, class_counts):
-        # Calculate effective number of samples
-        effective_num = 1.0 - torch.pow(self.beta, class_counts.float())
-        weights = (1.0 - self.beta) / effective_num
-        weights = weights / weights.sum() * self.num_classes
-        
-        # Apply weights to BCE loss
-        bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
-        weighted_loss = bce_loss * weights.unsqueeze(0).to(logits.device)
-        
-        return weighted_loss.mean()
-
-class CombinedLoss(nn.Module):
-    def __init__(self, loss_type='focal', alpha=0.7, beta=0.3, **kwargs):
-        super().__init__()
-        self.loss_type = loss_type
-        self.alpha = alpha
-        self.beta = beta
-        
-        self.bce_loss = nn.BCEWithLogitsLoss()
-        
-        if loss_type == 'focal':
-            self.secondary_loss = FocalLoss(**kwargs)
-        elif loss_type == 'asymmetric':
-            self.secondary_loss = AsymmetricLoss(**kwargs)
-        elif loss_type == 'class_balanced':
-            self.secondary_loss = ClassBalancedLoss(**kwargs)
-        
-    def forward(self, logits, labels, **kwargs):
-        primary_loss = self.bce_loss(logits, labels)
-        
-        if self.loss_type == 'class_balanced':
-            secondary_loss = self.secondary_loss(logits, labels, **kwargs)
-        else:
-            secondary_loss = self.secondary_loss(logits, labels)
-        
-        return self.alpha * primary_loss + self.beta * secondary_loss
-
 class CustomDataset(Dataset):
     def __init__(self, root, json_path):
         super().__init__()
@@ -145,7 +54,7 @@ class CustomDataset(Dataset):
         label = torch.zeros(100)
         for i in self.data['pairs'][name]:
             label[i] = 1.0
-        return image, label, name  # Return name for debugging if needed
+        return image, label
 
 def classifier(num_classes, device=DEVICE):
     predictor = nn.Linear(2048, num_classes).to(device)
@@ -233,7 +142,7 @@ def plot_label_distribution(y_true, y_pred, save_path=None):
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
 
-def evaluate_model(model, predictor, dataloader, criterion, device=DEVICE):
+def evaluate_model(model, predictor, dataloader, device=DEVICE):
     """Comprehensive model evaluation"""
     model.eval()
     predictor.eval()
@@ -242,14 +151,10 @@ def evaluate_model(model, predictor, dataloader, criterion, device=DEVICE):
     all_labels = []
     all_scores = []
     total_loss = 0
+    criterion = nn.BCEWithLogitsLoss()
     
     with torch.no_grad():
-        for batch_data in tqdm(dataloader, desc="Evaluating"):
-            if len(batch_data) == 3:
-                images, labels, _ = batch_data  # Unpack with names
-            else:
-                images, labels = batch_data
-            
+        for images, labels in tqdm(dataloader, desc="Evaluating"):
             images, labels = images.to(device), labels.to(device)
             features = model(images)
             logits = predictor(features)
@@ -277,43 +182,14 @@ def evaluate_model(model, predictor, dataloader, criterion, device=DEVICE):
     
     return metrics, all_labels, all_preds, all_scores
 
-def train(train_dataloader, test_dataloader, model, predictor, epochs, 
-          loss_type='focal', device=DEVICE):
-    """
-    Training function with configurable loss functions
-    
-    Args:
-        loss_type: 'bce', 'focal', 'asymmetric', 'class_balanced', 'combined'
-    """
+def train(train_dataloader, test_dataloader, model, predictor, epochs, device=DEVICE):
     
     optimizer = AdamW([
         {'params': predictor.parameters(), 'lr': 1e-5},
         {'params': model.parameters(), 'lr': 1e-6}
     ])
     
-    # Choose loss function based on loss_type
-    if loss_type == 'bce':
-        criterion = nn.BCEWithLogitsLoss()
-    elif loss_type == 'focal':
-        criterion = FocalLoss(alpha=1, gamma=2)
-    elif loss_type == 'asymmetric':
-        criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
-    elif loss_type == 'class_balanced':
-        # Calculate class frequencies first
-        class_counts = torch.zeros(100)
-        for batch_data in train_dataloader:
-            if len(batch_data) == 3:
-                _, labels, _ = batch_data
-            else:
-                _, labels = batch_data
-            class_counts += labels.sum(dim=0)
-        criterion = ClassBalancedLoss(num_classes=100, beta=0.9999)
-    elif loss_type == 'combined':
-        criterion = CombinedLoss(loss_type='focal', alpha=0.7, beta=0.3)
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
-    
-    print(f"Using loss function: {loss_type}")
+    criterion = nn.BCEWithLogitsLoss()
     
     # Training history
     train_losses = []
@@ -330,23 +206,13 @@ def train(train_dataloader, test_dataloader, model, predictor, epochs,
         total_loss = 0
         
         loop = tqdm(train_dataloader, desc=f'Epoch: {epoch+1}/{epochs}')
-        for batch_data in loop:
-            if len(batch_data) == 3:
-                images, labels, _ = batch_data
-            else:
-                images, labels = batch_data
-            
+        for images, labels in loop:
             images, labels = images.to(device), labels.to(device)
             
             optimizer.zero_grad()
             features = model(images)
             pred = predictor(features)
-            
-            # Calculate loss based on type
-            if loss_type == 'class_balanced':
-                loss = criterion(pred, labels, class_counts)
-            else:
-                loss = criterion(pred, labels)
+            loss = criterion(pred, labels)
             
             loss.backward()
             optimizer.step()
@@ -359,14 +225,14 @@ def train(train_dataloader, test_dataloader, model, predictor, epochs,
         
         # Validation phase
         val_metrics, val_labels, val_preds, val_scores = evaluate_model(
-            model, predictor, test_dataloader, criterion, device
+            model, predictor, test_dataloader, device
         )
         
         val_losses.append(val_metrics['avg_loss'])
         val_metrics_history.append(val_metrics)
         
         # Print epoch results
-        print(f"\nEpoch {epoch+1}/{epochs} - Loss Type: {loss_type}")
+        print(f"\nEpoch {epoch+1}/{epochs}:")
         print(f"Train Loss: {avg_train_loss:.4f}")
         print(f"Val Loss: {val_metrics['avg_loss']:.4f}")
         print(f"Subset Accuracy: {val_metrics['subset_accuracy']:.4f}")
@@ -388,28 +254,27 @@ def train(train_dataloader, test_dataloader, model, predictor, epochs,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_metrics['avg_loss'],
                 'val_metrics': val_metrics,
-                'train_loss': avg_train_loss,
-                'loss_type': loss_type
+                'train_loss': avg_train_loss
             }
-            torch.save(checkpoint, os.path.join(model_output_dir, f'best_model_{loss_type}_epoch_{epoch+1}.pt'))
+            torch.save(checkpoint, os.path.join(model_output_dir, f'best_model_epoch_{epoch+1}.pt'))
             
             # Save detailed evaluation for best model
             if epoch == epochs - 1 or epoch % 10 == 0:  # Save detailed metrics periodically
                 # Plot confusion matrices
                 plot_confusion_matrices(
                     val_labels, val_preds, 100, 
-                    save_path=os.path.join(model_output_dir, f'confusion_matrices_{loss_type}_epoch_{epoch+1}.png')
+                    save_path=os.path.join(model_output_dir, f'confusion_matrices_epoch_{epoch+1}.png')
                 )
                 
                 # Plot label distribution
                 plot_label_distribution(
                     val_labels, val_preds,
-                    save_path=os.path.join(model_output_dir, f'label_distribution_{loss_type}_epoch_{epoch+1}.png')
+                    save_path=os.path.join(model_output_dir, f'label_distribution_epoch_{epoch+1}.png')
                 )
                 
                 # Save detailed classification report
-                with open(os.path.join(model_output_dir, f'classification_report_{loss_type}_epoch_{epoch+1}.txt'), 'w') as f:
-                    f.write(f"Multi-label Classification Report - Loss: {loss_type}\n")
+                with open(os.path.join(model_output_dir, f'classification_report_epoch_{epoch+1}.txt'), 'w') as f:
+                    f.write("Multi-label Classification Report\n")
                     f.write("="*50 + "\n\n")
                     
                     for metric, value in val_metrics.items():
@@ -452,124 +317,35 @@ if __name__ == "__main__":
     print(f"Model parameters: {sum(p.numel() for p in resnet.parameters()):,}")
     print(f"Predictor parameters: {sum(p.numel() for p in predictor.parameters()):,}")
     
-    # Test different loss functions
-    loss_functions = ['bce', 'focal', 'asymmetric']  # Add more as needed
+    # Train model
+    best_metrics, train_losses, val_losses, val_metrics_history = train(
+        train_dataloader, test_dataloader, resnet, predictor, EPOCHS
+    )
     
-    results = {}
-    
-    for loss_type in loss_functions:
-        print(f"\n{'='*60}")
-        print(f"TRAINING WITH {loss_type.upper()} LOSS")
-        print(f"{'='*60}")
-        
-        # Reinitialize model for fair comparison
-        resnet = models.resnet50(weights='DEFAULT')
-        resnet.fc = nn.Identity()
-        resnet = resnet.to(DEVICE)
-        predictor = classifier(num_classes=100)
-        
-        # Train model with specific loss function
-        best_metrics, train_losses, val_losses, val_metrics_history = train(
-            train_dataloader, test_dataloader, resnet, predictor, 
-            epochs=20,  # Reduced for testing multiple loss functions
-            loss_type=loss_type
-        )
-        
-        # Store results
-        results[loss_type] = {
-            'best_metrics': best_metrics,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'val_metrics_history': val_metrics_history
-        }
-        
-        print(f"\nBest {loss_type.upper()} Results:")
-        print(f"Subset Accuracy: {best_metrics['subset_accuracy']:.4f}")
-        print(f"Hamming Accuracy: {best_metrics['hamming_accuracy']:.4f}")
-        print(f"F1 Micro: {best_metrics['f1_micro']:.4f}")
-        print(f"F1 Macro: {best_metrics['f1_macro']:.4f}")
-    
-    # Compare results
-    print(f"\n{'='*60}")
-    print("COMPARISON OF LOSS FUNCTIONS")
-    print(f"{'='*60}")
-    
-    comparison_metrics = ['subset_accuracy', 'hamming_accuracy', 'f1_micro', 'f1_macro']
-    
-    for metric in comparison_metrics:
-        print(f"\n{metric.upper()}:")
-        for loss_type in loss_functions:
-            value = results[loss_type]['best_metrics'][metric]
-            print(f"  {loss_type:12}: {value:.4f}")
-    
-    # Plot comparison
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    axes = axes.ravel()
-    
-    for i, metric in enumerate(comparison_metrics):
-        ax = axes[i]
-        values = [results[loss_type]['best_metrics'][metric] for loss_type in loss_functions]
-        bars = ax.bar(loss_functions, values, alpha=0.7, color=['blue', 'red', 'green', 'orange'][:len(loss_functions)])
-        ax.set_title(f'{metric.replace("_", " ").title()}')
-        ax.set_ylabel('Score')
-        
-        # Add value labels on bars
-        for bar, value in zip(bars, values):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + 0.001,
-                   f'{value:.3f}', ha='center', va='bottom')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(model_output_dir, 'loss_function_comparison.png'), dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    # Find best loss function
-    best_loss_type = max(loss_functions, key=lambda x: results[x]['best_metrics']['f1_micro'])
-    print(f"\nBEST LOSS FUNCTION: {best_loss_type.upper()}")
-    print(f"F1 Micro Score: {results[best_loss_type]['best_metrics']['f1_micro']:.4f}")
-    
-    # Save comparison results
-    with open(os.path.join(model_output_dir, 'loss_function_comparison.txt'), 'w') as f:
-        f.write("Loss Function Comparison Results\n")
-        f.write("="*40 + "\n\n")
-        
-        for loss_type in loss_functions:
-            f.write(f"{loss_type.upper()} LOSS:\n")
-            for metric, value in results[loss_type]['best_metrics'].items():
-                f.write(f"  {metric}: {value:.4f}\n")
-            f.write("\n")
-        
-        f.write(f"BEST LOSS FUNCTION: {best_loss_type.upper()}\n")
-        f.write(f"F1 Micro Score: {results[best_loss_type]['best_metrics']['f1_micro']:.4f}\n")
-    
-    # Plot training curves for the best loss function
+    # Plot training curves
     plt.figure(figsize=(15, 5))
     
-    best_train_losses = results[best_loss_type]['train_losses']
-    best_val_losses = results[best_loss_type]['val_losses']
-    best_val_metrics_history = results[best_loss_type]['val_metrics_history']
-    
     plt.subplot(1, 3, 1)
-    plt.plot(best_train_losses, label='Train Loss')
-    plt.plot(best_val_losses, label='Val Loss')
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title(f'Training Curves - {best_loss_type.upper()}')
+    plt.title('Training and Validation Loss')
     plt.legend()
     
     plt.subplot(1, 3, 2)
-    subset_acc = [m['subset_accuracy'] for m in best_val_metrics_history]
-    hamming_acc = [m['hamming_accuracy'] for m in best_val_metrics_history]
+    subset_acc = [m['subset_accuracy'] for m in val_metrics_history]
+    hamming_acc = [m['hamming_accuracy'] for m in val_metrics_history]
     plt.plot(subset_acc, label='Subset Accuracy')
     plt.plot(hamming_acc, label='Hamming Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
-    plt.title('Accuracy Metrics')
+    plt.title('Validation Accuracy')
     plt.legend()
     
     plt.subplot(1, 3, 3)
-    f1_micro = [m['f1_micro'] for m in best_val_metrics_history]
-    f1_macro = [m['f1_macro'] for m in best_val_metrics_history]
+    f1_micro = [m['f1_micro'] for m in val_metrics_history]
+    f1_macro = [m['f1_macro'] for m in val_metrics_history]
     plt.plot(f1_micro, label='F1 Micro')
     plt.plot(f1_macro, label='F1 Macro')
     plt.xlabel('Epoch')
@@ -581,7 +357,7 @@ if __name__ == "__main__":
     plt.savefig(os.path.join(model_output_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
     plt.show()
     
-    print(f"\nBest Model ({best_loss_type.upper()}) Metrics:")
+    print("\nBest Model Metrics:")
     print("="*30)
-    for metric, value in results[best_loss_type]['best_metrics'].items():
+    for metric, value in best_metrics.items():
         print(f"{metric}: {value:.4f}")
